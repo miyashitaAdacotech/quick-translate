@@ -1,0 +1,31 @@
+[package]
+name = "quick-translate"
+version = "0.1.0"
+edition = "2021"
+description = "Alfred Quick Translate inspired translation tool for Windows"
+
+[dependencies]
+# GUI フレームワーク（イミディエイトモードGUI）
+# default-features = false で accesskit（アクセシビリティ）を無効化
+# → icu_properties_data のビルドスクリプトが Smart App Control にブロックされる問題を回避
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+
+# HTTP クライアント（翻訳APIへのリクエスト用）
+# "blocking" = 同期モード（async不要でシンプル）
+# "json" = JSONレスポンスのパース用
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+# シリアライズ/デシリアライズ（設定ファイルの読み書き）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ホームディレクトリの取得（クロスプラットフォーム対応）
+dirs = "6"
+
+# クリップボード操作
+arboard = "3"
+
+# リリースビルドの最適化設定
+[profile.release]
+opt-level = "s"    # サイズ最適化（小さいバイナリ）
+strip = true       # デバッグ情報を除去

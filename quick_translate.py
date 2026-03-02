@@ -211,13 +211,20 @@ class TranslatePopup:
             pass
 
         # Sizing
-        w = config.get("popup_width", 600)
-        h = config.get("popup_height", 160)
+        self.min_w = 500
+        self.max_w = 1000
+        self.min_h = 130
+        self.max_h = 500
+        self.fsize = config.get("font_size", 13)
+        w = self.min_w
+        h = self.min_h
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         x = (sw - w) // 2
         y = (sh - h) // 3  # upper third
         self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self.screen_w = sw
+        self.screen_h = sh
 
         # Colors
         bg = "#1e1e2e"
@@ -252,7 +259,7 @@ class TranslatePopup:
         hint_label.pack(side=tk.RIGHT)
 
         # Input field
-        fsize = config.get("font_size", 13)
+        fsize = self.fsize
         self.input_var = tk.StringVar()
         self.input_entry = tk.Entry(
             main_frame,
@@ -273,7 +280,7 @@ class TranslatePopup:
             bg=bg, fg=result_fg,
             font=("Segoe UI", fsize),
             anchor="w", justify="left",
-            wraplength=w - 40
+            wraplength=self.min_w - 40
         )
         self.result_label.pack(fill=tk.X, pady=(8, 0))
 
@@ -295,6 +302,46 @@ class TranslatePopup:
             self.root.after_cancel(self.translate_timer)
         self.translate_timer = self.root.after(400, self._do_translate)
 
+    def _resize_to_content(self, input_text: str, result_text: str):
+        """Dynamically resize window based on content length."""
+        try:
+            # Estimate character width (rough: 1 CJK char ≈ 2 latin chars)
+            def effective_len(s):
+                n = 0
+                for ch in s:
+                    if '\u3000' <= ch <= '\u9FFF' or '\uF900' <= ch <= '\uFAFF':
+                        n += 2
+                    else:
+                        n += 1
+                return n
+
+            longer = max(effective_len(input_text), effective_len(result_text))
+            char_px = self.fsize * 0.65  # approx pixels per char
+
+            # Width: scale with text length
+            need_w = int(longer * char_px) + 80  # padding
+            new_w = max(self.min_w, min(need_w, self.max_w))
+
+            # Height: count wrapped lines for result
+            wrap_chars = max(1, int((new_w - 40) / char_px))
+            result_lines = max(1, -(-effective_len(result_text) // wrap_chars))  # ceil div
+            # Also count newlines
+            result_lines += result_text.count('\n')
+            line_h = self.fsize + 10
+            # Top bar ~30 + input ~40 + padding ~40 + result lines
+            need_h = 30 + 40 + 40 + int(result_lines * line_h)
+            new_h = max(self.min_h, min(need_h, self.max_h))
+
+            # Update wraplength
+            self.result_label.config(wraplength=new_w - 40)
+
+            # Reposition centered
+            x = (self.screen_w - new_w) // 2
+            y = (self.screen_h - new_h) // 3
+            self.root.geometry(f"{new_w}x{new_h}+{x}+{y}")
+        except Exception:
+            pass
+
     def _do_translate(self):
         text = self.input_var.get().strip()
         if not text:
@@ -305,7 +352,10 @@ class TranslatePopup:
         def _translate():
             try:
                 result, target = do_translate(text, self.config)
-                self.root.after(0, lambda: self.result_var.set(result))
+                def _update():
+                    self.result_var.set(result)
+                    self._resize_to_content(text, result)
+                self.root.after(0, _update)
                 self._last_result = result
                 self._last_target = target
             except Exception as e:
@@ -470,7 +520,7 @@ class SystemTrayApp:
 
         icon_image = self._create_icon_image()
 
-        def engine_text():
+        def engine_text(item=None):
             return f"エンジン: {self.config['engine'].upper()}"
 
         menu = pystray.Menu(
@@ -543,6 +593,7 @@ def main():
     parser = argparse.ArgumentParser(description="Quick Translate for Windows")
     parser.add_argument("--translate", "-t", type=str, help="Translate text directly")
     parser.add_argument("--popup", "-p", action="store_true", help="Show popup window")
+    parser.add_argument("--popup-file", type=str, help="Show popup with text from file")
     parser.add_argument("--selected", "-s", action="store_true", help="Translate selected text")
     parser.add_argument("--engine", "-e", choices=["google", "deepl"], help="Override engine")
     args = parser.parse_args()
@@ -553,6 +604,16 @@ def main():
 
     if args.translate:
         cli_translate(args.translate, config)
+    elif args.popup_file:
+        initial = ""
+        try:
+            with open(args.popup_file, "r", encoding="utf-8") as f:
+                initial = f.read().strip()
+            os.remove(args.popup_file)
+        except Exception:
+            pass
+        popup = TranslatePopup(config, initial_text=initial)
+        popup.run()
     elif args.popup:
         popup = TranslatePopup(config)
         popup.run()

@@ -1,0 +1,9 @@
+# Editor
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+
+# Rust
+quick-translate-rs/target/
