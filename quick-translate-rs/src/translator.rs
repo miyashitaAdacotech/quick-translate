@@ -86,6 +86,67 @@ fn google_translate(
     }
 }
 
+/// DeepL API を使って翻訳する
+///
+/// エンドポイント:
+///   無料プラン: https://api-free.deepl.com/v2/translate
+///   有料プラン: https://api.deepl.com/v2/translate
+///
+/// DeepL の言語コードは Google と少し異なる:
+///   - 英語: "EN" (Google: "en")
+///   - 日本語: "JA" (Google: "ja")
+///   - ソース言語に "auto" は指定不可（省略で自動判定）
+///
+/// APIキーが ":fx" で終わる場合は無料プラン。
+fn deepl_translate(
+    text: &str,
+    target: &str,
+    api_key: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let client = reqwest::blocking::Client::new();
+
+    // DeepL の言語コードは大文字
+    let target_upper = target.to_uppercase();
+
+    // APIキーが ":fx" で終わる → 無料プラン用エンドポイント
+    let base_url = if api_key.ends_with(":fx") {
+        "https://api-free.deepl.com/v2/translate"
+    } else {
+        "https://api.deepl.com/v2/translate"
+    };
+
+    // DeepL API は POST リクエスト
+    // Authorization ヘッダーに "DeepL-Auth-Key <APIキー>" を設定
+    let response = client
+        .post(base_url)
+        .header("Authorization", format!("DeepL-Auth-Key {}", api_key))
+        .form(&[
+            ("text", text),
+            ("target_lang", &target_upper),
+        ])
+        .send()?;
+
+    // HTTPステータスコードのチェック
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        return Err(format!("DeepL API エラー ({}): {}", status, body).into());
+    }
+
+    // レスポンスJSON:
+    // { "translations": [{ "text": "翻訳結果", "detected_source_language": "EN" }] }
+    let json: serde_json::Value = response.json()?;
+
+    let translated = json
+        .get("translations")
+        .and_then(|t| t.get(0))
+        .and_then(|t| t.get("text"))
+        .and_then(|t| t.as_str())
+        .ok_or("DeepL: 翻訳結果のパースに失敗")?;
+
+    Ok(translated.to_string())
+}
+
 /// テキストを翻訳する（メイン関数）
 ///
 /// 設定に基づいて翻訳エンジンを選択し、言語を自動判定して翻訳する。
@@ -114,13 +175,10 @@ pub fn translate(text: &str, config: &Config) -> Result<TranslationResult, Box<d
     // エンジンに応じて翻訳
     let translated = match config.engine.as_str() {
         "deepl" => {
-            // DeepL はフェーズ3で実装予定
-            // 今はエラーメッセージを返す
             if config.deepl_api_key.is_empty() {
                 return Err("DeepL APIキーが未設定です。~/.quick-translate/config.json を編集してください".into());
             }
-            // TODO: DeepL API 実装
-            return Err("DeepL APIは未実装です。Google翻訳を使用してください".into());
+            deepl_translate(text, &target, &config.deepl_api_key)?
         }
         _ => {
             // デフォルト: Google翻訳

@@ -1,6 +1,6 @@
 [package]
 name = "quick-translate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Alfred Quick Translate inspired translation tool for Windows"
 
@@ -24,6 +24,21 @@ dirs = "6"
 
 # クリップボード操作
 arboard = "3"
+
+# システムトレイアイコン（tauri-apps製）
+tray-icon = "0.19"
+
+# グローバルホットキー登録（tauri-apps製）
+global-hotkey = "0.7"
+
+# Windows API（メッセージループ用）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # リリースビルドの最適化設定
 [profile.release]

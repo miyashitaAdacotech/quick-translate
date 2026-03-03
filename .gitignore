@@ -1,5 +1,9 @@
 # Editor
 *.swp
+*.swo
+*~
+.vscode/
+.idea/
 
 # Python
 __pycache__/
@@ -7,3 +11,17 @@ __pycache__/
 
 # Rust
 quick-translate-rs/target/
+
+# Sensitive / Config
+.env
+*.key
+*.pem
+config.json
+
+# Logs
+*.log
+translate_log.yml
+
+# OS
+.DS_Store
+Thumbs.db

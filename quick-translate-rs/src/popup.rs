@@ -8,10 +8,93 @@ use eframe::egui;
 use std::fs;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::translator;
+
+// ------------------------------------------------------------
+// 単一起動ロック（ポップアップ多重起動防止）
+// ------------------------------------------------------------
+
+#[cfg(windows)]
+struct PopupInstanceGuard {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl Drop for PopupInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows_sys::Win32::System::Threading::ReleaseMutex(self.handle);
+            let _ = windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn acquire_popup_instance_lock(name: &str) -> Option<PopupInstanceGuard> {
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let mut name_wide: Vec<u16> = name.encode_utf16().collect();
+    name_wide.push(0);
+
+    unsafe {
+        let handle = CreateMutexW(std::ptr::null(), 1, name_wide.as_ptr());
+        if handle.is_null() {
+            return None;
+        }
+
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = windows_sys::Win32::Foundation::CloseHandle(handle);
+            return None;
+        }
+
+        Some(PopupInstanceGuard { handle })
+    }
+}
+
+#[cfg(not(windows))]
+fn acquire_popup_instance_lock(_name: &str) -> Option<()> {
+    Some(())
+}
+
+fn popup_request_file_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("quick_translate_popup_request.txt")
+}
+
+fn consume_popup_request(path: &std::path::Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let _ = fs::remove_file(path);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(windows)]
+fn is_current_process_foreground() -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return false;
+        }
+        let mut pid: u32 = 0;
+        let _ = GetWindowThreadProcessId(hwnd, &mut pid);
+        pid == GetCurrentProcessId()
+    }
+}
+
+#[cfg(not(windows))]
+fn is_current_process_foreground() -> bool {
+    true
+}
 
 /// Windows のシステムフォントから日本語対応フォントを読み込む
 ///
@@ -90,11 +173,30 @@ pub struct TranslatePopup {
 
     /// クリップボードにコピーするリクエスト
     copy_requested: bool,
+
+    /// 一度でもフォーカスを得たか（フォーカス喪失時クローズ判定用）
+    had_focus: bool,
+
+    /// Alt+Z のリクエストファイル（既存ポップアップ更新用）
+    request_file_path: std::path::PathBuf,
+
+    /// 外部リクエストファイルの前回ポーリング時刻
+    last_request_poll: Instant,
+
+    /// ポップアップ生成時刻（フォーカス未取得時のタイムアウト判定用）
+    created_at: Instant,
 }
 
 impl TranslatePopup {
     /// 新しいポップアップウィンドウを作成する
     pub fn new(config: Config, initial_text: String) -> Self {
+        let request_file_path = popup_request_file_path();
+        let initial_text = if initial_text.trim().is_empty() {
+            consume_popup_request(&request_file_path).unwrap_or_default()
+        } else {
+            initial_text
+        };
+
         Self {
             current_engine: config.engine.clone(),
             config,
@@ -110,7 +212,31 @@ impl TranslatePopup {
             result_receiver: None,
             first_frame: true,
             copy_requested: false,
+            had_focus: false,
+            request_file_path,
+            last_request_poll: Instant::now() - Duration::from_secs(1),
+            created_at: Instant::now(),
         }
+    }
+
+    /// Alt+Z の新規リクエストを読み取り、表示中の内容を更新する
+    fn check_external_request(&mut self) {
+        if self.last_request_poll.elapsed() < Duration::from_millis(80) {
+            return;
+        }
+        self.last_request_poll = Instant::now();
+
+        let Some(text) = consume_popup_request(&self.request_file_path) else {
+            return;
+        };
+
+        if text == self.input_text {
+            return;
+        }
+
+        self.input_text = text;
+        self.first_frame = true;
+        self.start_translation();
     }
 
     /// バックグラウンドスレッドで翻訳を実行する
@@ -183,6 +309,18 @@ impl TranslatePopup {
 /// 「状態が変わったら再描画」ではなく「毎フレーム全部描き直す」方式。
 impl eframe::App for TranslatePopup {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 一度フォーカスを得た後に他アプリへフォーカスが移ったら自動で閉じる
+        let focused = is_current_process_foreground();
+        if focused {
+            self.had_focus = true;
+        } else if self.had_focus || self.created_at.elapsed() > Duration::from_millis(1500) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        // Alt+Z の新規リクエストを反映（既存ウィンドウを再利用）
+        self.check_external_request();
+
         // 翻訳結果のチェック（毎フレーム）
         self.check_translation_result();
 
@@ -271,6 +409,7 @@ impl eframe::App for TranslatePopup {
 
                 // 初回フレームで入力フィールドにフォーカス
                 if self.first_frame {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     input_response.request_focus();
                     self.first_frame = false;
                 }
@@ -310,6 +449,12 @@ impl eframe::App for TranslatePopup {
 /// eframe::run_native() でネイティブウィンドウを起動する。
 /// この関数はウィンドウが閉じるまでブロックする。
 pub fn show_popup(config: Config, initial_text: String) -> Result<(), Box<dyn std::error::Error>> {
+    // 既にポップアップが開いている場合は新規起動しない
+    let _guard = match acquire_popup_instance_lock("QuickTranslatePopupSingleton") {
+        Some(g) => g,
+        None => return Ok(()),
+    };
+
     // ウィンドウのオプション設定
     let options = eframe::NativeOptions {
         // ウィンドウサイズ
@@ -332,6 +477,207 @@ pub fn show_popup(config: Config, initial_text: String) -> Result<(), Box<dyn st
             // 日本語フォントを読み込む（CJK文字の表示に必須）
             setup_japanese_fonts(&cc.egui_ctx);
             Ok(Box::new(TranslatePopup::new(config, initial_text)) as Box<dyn eframe::App>)
+        }),
+    )?;
+
+    Ok(())
+}
+
+// ============================================================
+// 結果表示ポップアップ（選択テキスト翻訳用）
+// ============================================================
+
+/// 結果表示専用ポップアップの状態
+///
+/// 入力フィールドなし。翻訳結果と原文を表示するだけ。
+/// Esc で閉じる、Ctrl+Enter で翻訳結果をコピー。
+struct ResultPopup {
+    /// 翻訳結果テキスト
+    translated: String,
+    /// 原文テキスト
+    original: String,
+    /// フォントサイズ
+    font_size: f32,
+
+    /// 一度でもフォーカスを得たか（フォーカス喪失時クローズ判定用）
+    had_focus: bool,
+
+    /// ポップアップ生成時刻（フォーカス未取得時のタイムアウト判定用）
+    created_at: Instant,
+}
+
+impl eframe::App for ResultPopup {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 一度フォーカスを得た後に他アプリへフォーカスが移ったら自動で閉じる
+        let focused = is_current_process_foreground();
+        if focused {
+            self.had_focus = true;
+        } else if self.had_focus || self.created_at.elapsed() > Duration::from_millis(1500) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        // Esc で閉じる
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        // Ctrl+Enter でコピーして閉じる
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)) {
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set_text(&self.translated);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        // --- 色定義 ---
+        let bg_color = egui::Color32::from_rgb(30, 30, 46);       // #1e1e2e
+        let result_color = egui::Color32::from_rgb(166, 227, 161); // #a6e3a1
+        let original_color = egui::Color32::from_rgb(108, 112, 134); // #6c7086
+        let hint_color = egui::Color32::from_rgb(88, 91, 112);     // #585b70
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(bg_color)
+                    .inner_margin(egui::Margin::same(16))
+            )
+            .show(ctx, |ui| {
+                // --- 翻訳結果（メイン表示、大きく緑で） ---
+                ui.colored_label(
+                    result_color,
+                    egui::RichText::new(&self.translated)
+                        .size(self.font_size),
+                );
+
+                ui.add_space(8.0);
+
+                // --- 区切り線 ---
+                ui.separator();
+
+                ui.add_space(4.0);
+
+                // --- 原文（小さくグレーで） ---
+                ui.colored_label(
+                    original_color,
+                    egui::RichText::new(&self.original)
+                        .size(self.font_size * 0.75),
+                );
+
+                ui.add_space(8.0);
+
+                // --- ヒント ---
+                ui.colored_label(
+                    hint_color,
+                    egui::RichText::new("Ctrl+Enter=コピー | Esc=閉じる")
+                        .size(10.0),
+                );
+            });
+    }
+}
+
+/// テキストの内容からウィンドウサイズを推定する
+///
+/// 文字数と行数に基づいて、全文が読めるサイズを計算する。
+fn estimate_window_size(text: &str, original: &str, font_size: f32) -> (f32, f32) {
+    // 両方のテキストで最長の行を探す
+    let all_text = format!("{}\n{}", text, original);
+    let lines: Vec<&str> = all_text.lines().collect();
+    let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(10);
+
+    // 文字幅の推定（日本語は全角なので font_size に近い幅、英語は約半分）
+    // 平均的に 0.7 * font_size を1文字幅とする
+    let char_width = font_size * 0.7;
+    let width = (max_chars as f32 * char_width + 64.0) // 64 = 左右パディング
+        .clamp(350.0, 900.0);
+
+    // 高さ: 翻訳結果の行数 + 原文の行数 + ヘッダー/フッター
+    let translated_lines = text.lines().count().max(1);
+    let original_lines = original.lines().count().max(1);
+    let line_height = font_size * 1.5;
+    let original_line_height = font_size * 0.75 * 1.5;
+    let height = (translated_lines as f32 * line_height
+        + original_lines as f32 * original_line_height
+        + 80.0) // パディング + 区切り線 + ヒント
+        .clamp(120.0, 600.0);
+
+    (width, height)
+}
+
+/// 結果表示ポップアップを表示する
+///
+/// テンプファイルから翻訳結果と原文を読み込んで表示する。
+/// ファイル形式:
+///   1行目以降〜"---"まで: 翻訳結果
+///   "---"以降: 原文
+///
+/// # 引数
+/// - `result_file`: テンプファイルのパス
+/// - `config`: アプリケーション設定
+pub fn show_result_popup(result_file: &str, config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    // 既にポップアップが開いている場合は新規起動しない
+    let _guard = match acquire_popup_instance_lock("QuickTranslatePopupSingleton") {
+        Some(g) => g,
+        None => return Ok(()),
+    };
+
+    // テンプファイルを読む
+    let content = fs::read_to_string(result_file)?;
+    // 読み終わったら削除
+    let _ = fs::remove_file(result_file);
+
+    // "---" で分割
+    let mut translated = String::new();
+    let mut original = String::new();
+    let mut is_original = false;
+
+    for line in content.lines() {
+        if line.trim() == "---" {
+            is_original = true;
+            continue;
+        }
+        if is_original {
+            if !original.is_empty() {
+                original.push('\n');
+            }
+            original.push_str(line);
+        } else {
+            if !translated.is_empty() {
+                translated.push('\n');
+            }
+            translated.push_str(line);
+        }
+    }
+
+    // ウィンドウサイズを推定
+    let (width, height) = estimate_window_size(&translated, &original, config.font_size);
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([width, height])
+            .with_decorations(false)
+            .with_always_on_top()
+            .with_transparent(true)
+            .with_resizable(false),
+        ..Default::default()
+    };
+
+    let font_size = config.font_size;
+
+    eframe::run_native(
+        "Quick Translate Result",
+        options,
+        Box::new(move |cc| {
+            setup_japanese_fonts(&cc.egui_ctx);
+            Ok(Box::new(ResultPopup {
+                translated,
+                original,
+                font_size,
+                had_focus: false,
+                created_at: Instant::now(),
+            }) as Box<dyn eframe::App>)
         }),
     )?;
 
