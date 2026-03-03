@@ -92,7 +92,7 @@ impl CliArgs {
                     println!();
                     println!("トレイ常駐時のショートカット:");
                     println!("  Ctrl+Shift+T  ポップアップを開く");
-                    println!("  Alt+Z         選択テキストを翻訳");
+                    println!("  Ctrl+Shift+Y  選択テキストを翻訳");
                     std::process::exit(0);
                 }
                 _ => {
@@ -140,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         popup::show_popup(config, String::new())?;
     } else {
         // デフォルト: トレイ常駐モード
-        tray::run_tray()?;
+        tray::run_tray(&config)?;
     }
 
     Ok(())

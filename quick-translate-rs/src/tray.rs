@@ -6,7 +6,7 @@
 //
 // ホットキー:
 //   Ctrl+Shift+T → 入力ポップアップ（自分で文字を打つ）
-//   Alt+Z → 選択テキスト翻訳（Ctrl+Cしてから翻訳→結果表示）
+//   Ctrl+Shift+Y → 選択テキスト翻訳（Ctrl+Cしてから翻訳→結果表示）
 
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
@@ -22,6 +22,7 @@ use std::fs;
 use std::process::Command;
 
 use crate::clipboard;
+use crate::config::Config;
 
 #[cfg(windows)]
 struct TrayInstanceGuard {
@@ -140,10 +141,63 @@ fn spawn_self(args: &[&str]) {
     }
 }
 
+fn parse_hotkey(spec: &str) -> Option<HotKey> {
+    let normalized = spec.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let mut modifiers = Modifiers::empty();
+    let mut key_code: Option<Code> = None;
+
+    for part in normalized.split('+').map(str::trim).filter(|p| !p.is_empty()) {
+        match part {
+            "ctrl" | "control" => modifiers |= Modifiers::CONTROL,
+            "shift" => modifiers |= Modifiers::SHIFT,
+            "alt" => modifiers |= Modifiers::ALT,
+            "a" => key_code = Some(Code::KeyA),
+            "b" => key_code = Some(Code::KeyB),
+            "c" => key_code = Some(Code::KeyC),
+            "d" => key_code = Some(Code::KeyD),
+            "e" => key_code = Some(Code::KeyE),
+            "f" => key_code = Some(Code::KeyF),
+            "g" => key_code = Some(Code::KeyG),
+            "h" => key_code = Some(Code::KeyH),
+            "i" => key_code = Some(Code::KeyI),
+            "j" => key_code = Some(Code::KeyJ),
+            "k" => key_code = Some(Code::KeyK),
+            "l" => key_code = Some(Code::KeyL),
+            "m" => key_code = Some(Code::KeyM),
+            "n" => key_code = Some(Code::KeyN),
+            "o" => key_code = Some(Code::KeyO),
+            "p" => key_code = Some(Code::KeyP),
+            "q" => key_code = Some(Code::KeyQ),
+            "r" => key_code = Some(Code::KeyR),
+            "s" => key_code = Some(Code::KeyS),
+            "t" => key_code = Some(Code::KeyT),
+            "u" => key_code = Some(Code::KeyU),
+            "v" => key_code = Some(Code::KeyV),
+            "w" => key_code = Some(Code::KeyW),
+            "x" => key_code = Some(Code::KeyX),
+            "y" => key_code = Some(Code::KeyY),
+            "z" => key_code = Some(Code::KeyZ),
+            _ => return None,
+        }
+    }
+
+    key_code.map(|code| {
+        if modifiers.is_empty() {
+            HotKey::new(None, code)
+        } else {
+            HotKey::new(Some(modifiers), code)
+        }
+    })
+}
+
 /// システムトレイアプリのメインループを実行する
 ///
 /// この関数は終了するまでブロックする（アプリのメインループ）。
-pub fn run_tray() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_tray(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let _guard = match acquire_tray_instance_lock("QuickTranslateTraySingleton") {
         Some(g) => g,
         None => {
@@ -154,7 +208,8 @@ pub fn run_tray() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- メニューの作成 ---
     let menu = Menu::new();
-    let item_popup = MenuItem::new("ポップアップを開く (Ctrl+Shift+T)", true, None);
+    let popup_label = format!("ポップアップを開く ({})", config.hotkey_popup);
+    let item_popup = MenuItem::new(&popup_label, true, None);
     let item_quit = MenuItem::new("終了", true, None);
     menu.append(&item_popup)?;
     menu.append(&item_quit)?;
@@ -172,27 +227,41 @@ pub fn run_tray() -> Result<(), Box<dyn std::error::Error>> {
     // --- グローバルホットキーの登録 ---
     let hotkey_manager = GlobalHotKeyManager::new()?;
 
-    // Ctrl+Shift+T → 入力ポップアップ
-    let hk_popup = HotKey::new(
-        Some(Modifiers::CONTROL | Modifiers::SHIFT),
-        Code::KeyT,
-    );
-    // Alt+Z → 選択テキスト翻訳（右Altでも左Altでも発火する）
-    let hk_selected = HotKey::new(
-        Some(Modifiers::ALT),
-        Code::KeyZ,
-    );
+    let default_popup = "ctrl+shift+t".to_string();
+    let default_selected = "ctrl+shift+y".to_string();
+
+    let popup_spec = if config.hotkey_popup.trim().is_empty() {
+        default_popup.as_str()
+    } else {
+        config.hotkey_popup.as_str()
+    };
+    let selected_spec = if config.hotkey_selected.trim().is_empty() {
+        default_selected.as_str()
+    } else {
+        config.hotkey_selected.as_str()
+    };
+
+    let hk_popup = parse_hotkey(popup_spec)
+        .or_else(|| parse_hotkey(&default_popup))
+        .ok_or_else(|| format!("ポップアップホットキーの形式が不正です: {}", popup_spec))?;
+    let hk_selected = parse_hotkey(selected_spec)
+        .or_else(|| parse_hotkey(&default_selected))
+        .ok_or_else(|| format!("選択翻訳ホットキーの形式が不正です: {}", selected_spec))?;
 
     hotkey_manager.register(hk_popup)?;
     hotkey_manager.register(hk_selected)?;
 
     println!("Quick Translate がシステムトレイで起動しました");
-    println!("  Ctrl+Shift+T: ポップアップを開く");
-    println!("  Alt+Z:        選択テキストを翻訳");
+    println!("  {}: ポップアップを開く", popup_spec);
+    println!("  {}: 選択テキストを翻訳", selected_spec);
 
-    // ホットキー連打防止用のタイムスタンプ
-    // 短時間のチャタリングのみ抑止し、通常の連続操作は通す
-    let mut last_hotkey_time = std::time::Instant::now() - std::time::Duration::from_secs(10);
+    // ホットキー連打防止用タイムスタンプ
+    // RegisterHotKey はキー長押しでリピートイベントが飛ぶため、
+    // 選択翻訳は長めにクールダウンする。
+    let mut last_popup_hotkey_time =
+        std::time::Instant::now() - std::time::Duration::from_secs(10);
+    let mut last_selected_hotkey_time =
+        std::time::Instant::now() - std::time::Duration::from_secs(10);
 
     // --- Windows メッセージループ ---
     // global-hotkey は RegisterHotKey を使うため、
@@ -218,17 +287,21 @@ pub fn run_tray() -> Result<(), Box<dyn std::error::Error>> {
 
             // --- ホットキーイベントの処理 ---
             while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-                // 連打防止: 前回から300ms以内のイベントは無視
-                if last_hotkey_time.elapsed().as_millis() < 300 {
-                    continue;
-                }
-                last_hotkey_time = std::time::Instant::now();
-
                 if event.id == hk_popup.id() {
+                    // 連打防止: 前回から300ms以内は無視
+                    if last_popup_hotkey_time.elapsed().as_millis() < 300 {
+                        continue;
+                    }
+                    last_popup_hotkey_time = std::time::Instant::now();
                     // Ctrl+Shift+T: 入力ポップアップを別プロセスで起動
                     spawn_self(&["--popup"]);
                 } else if event.id == hk_selected.id() {
-                    // Ctrl+Q: 選択テキスト翻訳
+                    // 連打防止: 選択翻訳は長押しリピートを抑止（1.5秒）
+                    if last_selected_hotkey_time.elapsed().as_millis() < 1500 {
+                        continue;
+                    }
+                    last_selected_hotkey_time = std::time::Instant::now();
+                    // 選択テキスト翻訳
                     handle_selected_translation();
                 }
             }

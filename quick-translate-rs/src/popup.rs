@@ -185,6 +185,9 @@ pub struct TranslatePopup {
 
     /// ポップアップ生成時刻（フォーカス未取得時のタイムアウト判定用）
     created_at: Instant,
+
+    /// 最後に適用したウィンドウサイズ（過剰なリサイズを防ぐ）
+    last_viewport_size: Option<(f32, f32)>,
 }
 
 impl TranslatePopup {
@@ -216,6 +219,7 @@ impl TranslatePopup {
             request_file_path,
             last_request_poll: Instant::now() - Duration::from_secs(1),
             created_at: Instant::now(),
+            last_viewport_size: None,
         }
     }
 
@@ -300,6 +304,20 @@ impl TranslatePopup {
             }
         }
     }
+
+    fn adjust_viewport_size(&mut self, ctx: &egui::Context) {
+        let (width, height) =
+            estimate_live_popup_size(&self.input_text, &self.result_text, self.config.font_size);
+        let should_resize = match self.last_viewport_size {
+            None => true,
+            Some((w, h)) => (w - width).abs() > 6.0 || (h - height).abs() > 6.0,
+        };
+
+        if should_resize {
+            self.last_viewport_size = Some((width, height));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
+        }
+    }
 }
 
 /// eframe::App トレイトの実装
@@ -323,6 +341,9 @@ impl eframe::App for TranslatePopup {
 
         // 翻訳結果のチェック（毎フレーム）
         self.check_translation_result();
+
+        // テキスト量に応じてポップアップサイズを調整
+        self.adjust_viewport_size(ctx);
 
         // デバウンス: 最後の入力変更から400ms後に翻訳を開始
         if let Some(last_change) = self.last_input_change {
@@ -444,6 +465,59 @@ impl eframe::App for TranslatePopup {
     }
 }
 
+fn count_wrapped_lines(text: &str, chars_per_line: usize) -> usize {
+    if text.trim().is_empty() {
+        return 0;
+    }
+    let per_line = chars_per_line.max(8);
+    let mut lines = 0usize;
+    for line in text.lines() {
+        let n = line.chars().count().max(1);
+        lines += ((n + per_line - 1) / per_line).max(1);
+    }
+    lines.max(1)
+}
+
+fn estimate_live_popup_size(input_text: &str, result_text: &str, font_size: f32) -> (f32, f32) {
+    let char_width = font_size * 0.68;
+    let width_chars = if !result_text.trim().is_empty() {
+        // 結果表示中は「結果本文」を優先して幅を決める（横長化を防ぐ）
+        let result_max = result_text
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(24);
+        let has_spaces = result_text.contains(' ');
+        let preferred = if has_spaces { 52 } else { 34 };
+        result_max.min(preferred + 14).max(28)
+    } else {
+        // 結果がない間は入力の長さを見るが、過剰に広げない
+        let input_max = input_text
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(24)
+            .min(60);
+        input_max.max(24)
+    };
+    let width = (width_chars as f32 * char_width + 88.0).clamp(520.0, 860.0);
+
+    let text_area_width = (width - 32.0).max(220.0);
+    let chars_per_line = (text_area_width / char_width).floor() as usize;
+    let result_lines = count_wrapped_lines(result_text, chars_per_line);
+    let result_height = result_lines as f32 * font_size * 1.45;
+
+    let height = (32.0  // top bar
+        + 8.0          // spacing
+        + 32.0         // input
+        + 12.0         // spacing
+        + result_height
+        + 28.0)        // bottom padding
+        .clamp(190.0, 840.0);
+
+    (width, height)
+}
+
 /// ポップアップウィンドウを表示する
 ///
 /// eframe::run_native() でネイティブウィンドウを起動する。
@@ -455,11 +529,14 @@ pub fn show_popup(config: Config, initial_text: String) -> Result<(), Box<dyn st
         None => return Ok(()),
     };
 
+    let (initial_width, initial_height) =
+        estimate_live_popup_size(&initial_text, "", config.font_size);
+
     // ウィンドウのオプション設定
     let options = eframe::NativeOptions {
         // ウィンドウサイズ
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 200.0])
+            .with_inner_size([initial_width, initial_height])
             .with_decorations(false)        // タイトルバーなし（ボーダーレス）
             .with_always_on_top()           // 常に最前面
             .with_transparent(true)         // 背景透過を有効化
